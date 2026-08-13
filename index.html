@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="es-AR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=overlays-content" />
+    <meta name="theme-color" content="#070708" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="REPOSICIÓN" />
+    <link rel="icon" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Stencil+Display:wght@700&family=Schibsted+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <title>REPOSICIÓN</title>
+    <style>
+      html, body { margin: 0; background: #070708; color: #f4efe4; font-family: sans-serif; }
+      #boot-fallback {
+        display: none;
+        padding: 1.5rem;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="boot-fallback">
+      <p>REPOSICIÓN no arrancó.</p>
+      <p style="opacity:.7;font-size:.9rem">Cerrá la app y volvé a abrirla. Si sigue negro: reinstalá el APK.</p>
+    </div>
+    <script>
+      // Limpiar liveBundle roto (causaba pantalla negra al "Actualizar").
+      try { localStorage.removeItem('reposicion.liveBundle') } catch (e) {}
+      window.__Reposicion_LIVE__ = null
+      setTimeout(function () {
+        var root = document.getElementById('root')
+        var fb = document.getElementById('boot-fallback')
+        if (root && fb && !root.childElementCount) fb.style.display = 'block'
+      }, 4000)
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
