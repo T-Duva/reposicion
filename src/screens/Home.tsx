@@ -7,19 +7,17 @@ import { nameMatchesQuery } from '../lib/nameFilter'
 import { formatDateISO, parseArNumber } from '../lib/format'
 import { DEFAULT_RUBROS, isDefaultRubro } from '../lib/stockRubros'
 import {
+  clearStockPendingAdds,
   commitStockDraftsBestEffort,
   commitStockDraftsFromDb,
   commitStockDraftsNow,
   loadStockDraftNames,
-  loadStockPendingAdds,
   registerStockDraftCommitter,
   registerStockPendingAddsFlusher,
   saveStockDraftNames,
-  saveStockPendingAdds,
 } from '../lib/stockDraftFlush'
 import {
   ensureStockCatalogFromBackup,
-  isStockItemRemoveBlocked,
   stockCatalogReconcilePatches,
 } from '../lib/localDb'
 import { useApp } from '../state/store'
@@ -42,13 +40,12 @@ export function Home() {
   const [open, setOpen] = useState<Record<string, boolean>>({})
   const [addingRubro, setAddingRubro] = useState(false)
   const [newRubroName, setNewRubroName] = useState('')
-  const [addQ, setAddQ] = useState<Record<string, string>>(() => loadStockPendingAdds())
+  const [addQ, setAddQ] = useState<Record<string, string>>({})
   const [focusItemId, setFocusItemId] = useState<string | null>(null)
   const [draftNames, setDraftNames] = useState<Record<string, string>>(() => loadStockDraftNames())
   const addQRef = useRef(addQ)
   addQRef.current = addQ
   const draftTimerRef = useRef<Record<string, number>>({})
-  const flushingAddsRef = useRef(false)
 
   const flushStockEdits = () => {
     for (const t of Object.values(draftTimerRef.current)) window.clearTimeout(t)
@@ -111,19 +108,16 @@ export function Home() {
   const patchAddQ = (rubroId: string, value: string) => {
     const next = { ...addQRef.current, [rubroId]: value }
     addQRef.current = next
-    saveStockPendingAdds(next)
     setAddQ(next)
   }
 
   const clearAddQ = (rubroId: string) => {
     const next = { ...addQRef.current, [rubroId]: '' }
     addQRef.current = next
-    saveStockPendingAdds(next)
     setAddQ(next)
   }
 
   // Cada vez que se abre Stock: confirmar borradores de nombres y rescatar ítems del backup.
-  // No volcar "Producto · Enter agrega": el texto vuelve al input; Enter/blur/salir confirman.
   useEffect(() => {
     const state = useApp.getState()
     if (!state.user) return
@@ -132,18 +126,8 @@ export function Home() {
     if (reconcile.length) state.applyAll(reconcile)
   }, [])
 
-  const flushPendingAddQ = () => {
-    if (flushingAddsRef.current) return
-    flushingAddsRef.current = true
-    try {
-      for (const [rubroId, raw] of Object.entries(addQRef.current)) {
-        const typed = (raw || '').trim()
-        if (typed) addProduct(rubroId, typed)
-      }
-    } finally {
-      flushingAddsRef.current = false
-    }
-  }
+  // addQ es SOLO filtro: nunca crear productos al salir / flush.
+  const flushPendingAddQ = () => {}
 
   useEffect(() => {
     const flushDrafts = () => {
@@ -161,7 +145,7 @@ export function Home() {
     }
   }, [])
 
-  // Persistir descripciones y altas pendientes al salir de Stock.
+  // Persistir descripciones al salir de Stock (no altas desde filtro).
   useEffect(
     () => () => {
       for (const t of Object.values(draftTimerRef.current)) window.clearTimeout(t)
@@ -173,7 +157,6 @@ export function Home() {
         state.user,
         (p) => state.applyAll(p),
         () => useApp.getState().db,
-        { pendingAdds: true },
       )
     },
     [],
@@ -190,10 +173,10 @@ export function Home() {
     return () => window.clearTimeout(t)
   }, [draftNames])
 
-  // Solo persistir el texto: no crear productos al tipear (Enter / blur / salir de Stock).
+  // Filtro en memoria solamente (no persistir como "pending add").
   useEffect(() => {
-    saveStockPendingAdds(addQ)
-  }, [addQ])
+    clearStockPendingAdds()
+  }, [])
 
   useEffect(() => {
     if (!user) return
@@ -256,20 +239,22 @@ export function Home() {
     const products = db.products || []
     for (const item of db.stockItems || []) {
       const list = map.get(item.rubroId) || []
-      // Un solo renglón por producto o por mismo nombre (o vacío) en el rubro (evita “fantasmas”).
+      // Un solo renglón por productId. Los vacíos (sin nombre) NO se colapsan entre sí.
       if (list.some((s) => s.productId === item.productId)) continue
       const label = stockItemLabel(item, products.find((p) => p.id === item.productId)?.name)
         .trim()
         .toLowerCase()
-      if (
-        list.some((s) => {
-          const other = stockItemLabel(s, products.find((p) => p.id === s.productId)?.name)
-            .trim()
-            .toLowerCase()
-          return other === label
-        })
-      ) {
-        continue
+      if (label) {
+        if (
+          list.some((s) => {
+            const other = stockItemLabel(s, products.find((p) => p.id === s.productId)?.name)
+              .trim()
+              .toLowerCase()
+            return other === label
+          })
+        ) {
+          continue
+        }
       }
       list.push(item)
       map.set(item.rubroId, list)
@@ -354,78 +339,10 @@ export function Home() {
     setOpen((prev) => ({ ...prev, [id]: true }))
   }
 
-  const addProduct = (rubroId: string, name: string, existingId?: string) => {
-    // Sacar de pending antes de flush: evita recursión addProduct → flush → pending → addProduct.
-    clearAddQ(rubroId)
-    flushStockEdits()
-    const { db: liveDb, user: liveUser, apply: liveApply, applyAll: liveApplyAll } = useApp.getState()
-    if (!liveUser) return
-    const trimmed = name.trim()
-    if (!trimmed && !existingId) return
-    let productId = existingId
-    let productName = trimmed
-    if (!productId) {
-      const found = liveDb.products.find((p) => p.name.toLowerCase() === trimmed.toLowerCase())
-      if (found) {
-        productId = found.id
-        productName = found.name
-      } else {
-        productId = newId()
-        productName = trimmed
-      }
-    } else {
-      productName = liveDb.products.find((p) => p.id === productId)?.name ?? trimmed
-    }
-    // Tras un ×, applyAll hace flush de pending: no recrear el mismo rubro+producto/nombre.
-    if (isStockItemRemoveBlocked({ rubroId, productId, label: productName })) return
-    const already = (liveDb.stockItems || []).find(
-      (s) => s.productId === productId && s.rubroId === rubroId,
-    )
-    if (already) {
-      setOpen((prev) => ({ ...prev, [rubroId]: true }))
-      return
-    }
-    const isNewProduct = !liveDb.products.some((p) => p.id === productId)
-    const row: StockItem = {
-      id: newId(),
-      rubroId,
-      productId,
-      qty: 0,
-      label: productName,
-      createdBy: liveUser,
-      createdAt: Date.now(),
-    }
-    if (isNewProduct) {
-      liveApplyAll([
-        {
-          op: 'upsert',
-          col: 'products',
-          row: { id: productId, name: productName, createdBy: liveUser, createdAt: Date.now() },
-        },
-        { op: 'upsert', col: 'stockItems', row },
-      ])
-    } else {
-      liveApply({ op: 'upsert', col: 'stockItems', row })
-    }
-    setOpen((prev) => ({ ...prev, [rubroId]: true }))
-  }
-
   const addBlankInRubro = (rubroId: string) => {
     flushStockEdits()
     if (!user) return
-    // Reusar el vacío existente: varios + seguidos generaban fantasmas que el × no limpiaba del todo.
-    const catalog = ensureStockCatalogFromBackup(useApp.getState().db)
-    const existingBlank = (catalog.stockItems || []).find((s) => {
-      if (s.rubroId !== rubroId) return false
-      if (isStockItemRemoveBlocked(s)) return false
-      const name = stockItemLabel(s, catalog.products.find((p) => p.id === s.productId)?.name)
-      return !name.trim()
-    })
-    if (existingBlank) {
-      setOpen((prev) => ({ ...prev, [rubroId]: true }))
-      setFocusItemId(existingBlank.id)
-      return
-    }
+    // Siempre crear uno nuevo: el + debe permitir infinitos productos por rubro.
     const productId = newId()
     const itemId = newId()
     applyAll([
@@ -539,19 +456,17 @@ export function Home() {
         {visibleRubros.map((rubro) => {
           const checked = !!open[rubro.id]
           const allItems = itemsByRubro.get(rubro.id) || []
-          const items = query
+          const typed = (addQ[rubro.id] || '').trim()
+          const filterText = typed || query
+          const items = filterText
             ? allItems.filter((item) => {
                 const name = stockItemLabel(item, db.products.find((p) => p.id === item.productId)?.name)
-                return nameMatchesQuery(name, query)
+                return nameMatchesQuery(name, filterText)
               })
             : allItems
-          const typed = (addQ[rubro.id] || '').trim()
-          const matches = typed
-            ? db.products.filter((p) => nameMatchesQuery(p.name, typed)).slice(0, 8)
-            : []
-          const expanded = checked || (query.length > 0 && items.length > 0)
+          const expanded = checked || (filterText.length > 0 && items.length > 0)
           return (
-            <li key={rubro.id} className={`stock-rubro ${expanded ? 'open' : ''}${query && items.length ? ' hit' : ''}`}>
+            <li key={rubro.id} className={`stock-rubro ${expanded ? 'open' : ''}${filterText && items.length ? ' hit' : ''}`}>
               <div className="stock-rubro-head">
                 <button
                   type="button"
@@ -592,29 +507,22 @@ export function Home() {
                       <input
                         value={addQ[rubro.id] || ''}
                         enterKeyHint="search"
-                        placeholder="Ej. bidón 20L"
+                        placeholder="Buscar en este rubro…"
                         onChange={(e) => patchAddQ(rubro.id, e.target.value)}
                       />
                     </label>
                   </FocusField>
-                  {matches.length > 0 && (
-                    <ul className="suggest">
-                      {matches.map((p) => (
-                        <li key={p.id} className="suggest-row">
-                          <button type="button" className="pick" onClick={() => addProduct(rubro.id, p.name, p.id)}>
-                            {p.name}
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
+                  {items.length === 0 && (
+                    <p className="empty">
+                      {filterText ? `Nada coincide con «${filterText}».` : 'Sin productos en este rubro.'}
+                    </p>
                   )}
-                  {items.length === 0 && <p className="empty">Sin productos en este rubro.</p>}
                   <ul className="stock-items">
                     {items.map((item) => {
                       const prod = db.products.find((p) => p.id === item.productId)
                       const savedName = stockItemLabel(item, prod?.name)
                       const displayName = item.id in draftNames ? draftNames[item.id] : savedName
-                      const hit = !!query && nameMatchesQuery(displayName, query)
+                      const hit = !!filterText && nameMatchesQuery(displayName, filterText)
                       const commitItemName = (name: string) => {
                         const pending = draftTimerRef.current[item.id]
                         if (pending) {
@@ -704,16 +612,8 @@ export function Home() {
                                 saveStockDraftNames(next)
                                 return next
                               })
-                              // Sincrónico: applyAll hace flush de pending en el mismo tick.
-                              // Hay que vaciar addQRef (no solo localStorage/state) o el flusher recrea el fantasma.
-                              const pending = loadStockPendingAdds()
-                              const typed = (
-                                pending[item.rubroId] ||
-                                addQRef.current[item.rubroId] ||
-                                ''
-                              )
-                                .trim()
-                                .toLowerCase()
+                              // Hay que vaciar addQRef si el filtro coincidía con el borrado.
+                              const typed = (addQRef.current[item.rubroId] || '').trim().toLowerCase()
                               if (typed && typed === needle) clearAddQ(item.rubroId)
                               if (ids.length === 1) {
                                 apply({ op: 'remove', col: 'stockItems', id: ids[0] })
